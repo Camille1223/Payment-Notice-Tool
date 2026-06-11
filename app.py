@@ -226,18 +226,31 @@ def safe_filename(name: str) -> str:
     return "".join(c for c in name if c not in r'\/:*?"<>|').strip() or "未知"
 
 
-def docx_to_pdf(docx_path: str, pdf_path: str):
+def batch_docx_to_pdf(pairs: list[tuple[str, str]]):
+    """Convert a list of (docx_path, pdf_path) pairs using a single Word instance.
+    Initializes COM on the current thread (required when called from a Flask worker thread).
+    """
+    import pythoncom
     import win32com.client
+    pythoncom.CoInitialize()
+    errors = []
     word = win32com.client.Dispatch("Word.Application")
     word.Visible = False
-    doc = None
     try:
-        doc = word.Documents.Open(os.path.abspath(docx_path))
-        doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
+        for docx_path, pdf_path in pairs:
+            doc = None
+            try:
+                doc = word.Documents.Open(os.path.abspath(docx_path))
+                doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
+            except Exception as e:
+                errors.append((os.path.basename(docx_path), str(e)))
+            finally:
+                if doc:
+                    doc.Close(False)
     finally:
-        if doc:
-            doc.Close(False)
         word.Quit()
+        pythoncom.CoUninitialize()
+    return errors
 
 
 @app.route("/")
@@ -261,36 +274,42 @@ def generate():
     if not rows:
         return jsonify(error="Sheet1 没有数据行"), 400
 
-    # Track used names to avoid collisions (same company, multiple rows)
     name_count: dict[str, int] = {}
     zip_buffer = io.BytesIO()
-    pdf_errors = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_pairs: list[tuple[str, str]] = []
+
+        # Generate all Word files first
+        for i, row in enumerate(rows, 1):
+            company = row.get("公司名称", f"客户{i}")
+            base = safe_filename(company) + "_付款通知书"
+            name_count[base] = name_count.get(base, 0) + 1
+            count = name_count[base]
+            unique_name = base if count == 1 else f"{base}_{count}"
+
+            docx_out = os.path.join(tmpdir, f"{unique_name}.docx")
+            with MailMerge(io.BytesIO(template_bytes)) as doc:
+                doc.merge(**{k: str(v) for k, v in row.items()})
+                doc.write(docx_out)
+
+            pdf_out = os.path.join(tmpdir, f"{unique_name}.pdf")
+            pdf_pairs.append((docx_out, pdf_out))
+
+        # Convert all to PDF in one Word session
+        pdf_errors = batch_docx_to_pdf(pdf_pairs)
+        if pdf_errors:
+            for name, err in pdf_errors:
+                app.logger.warning("PDF error %s: %s", name, err)
+
+        # Pack everything into ZIP
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, row in enumerate(rows, 1):
-                company = row.get("公司名称", f"客户{i}")
-                base = safe_filename(company) + "_付款通知书"
-                name_count[base] = name_count.get(base, 0) + 1
-                count = name_count[base]
-                unique_name = base if count == 1 else f"{base}_{count}"
-
-                docx_out = os.path.join(tmpdir, f"{unique_name}.docx")
-                with MailMerge(io.BytesIO(template_bytes)) as doc:
-                    doc.merge(**{k: str(v) for k, v in row.items()})
-                    doc.write(docx_out)
-                zf.write(docx_out, f"Word/{unique_name}.docx")
-
-                pdf_out = os.path.join(tmpdir, f"{unique_name}.pdf")
-                try:
-                    docx_to_pdf(docx_out, pdf_out)
-                    zf.write(pdf_out, f"PDF/{unique_name}.pdf")
-                except Exception as e:
-                    pdf_errors.append(f"{unique_name}: {e}")
-                    app.logger.warning("PDF error: %s", e)
-
-    if pdf_errors:
-        app.logger.warning("PDF conversion failures: %s", pdf_errors)
+            for docx_out, pdf_out in pdf_pairs:
+                base = os.path.basename(docx_out)
+                name_no_ext = base[:-5]
+                zf.write(docx_out, f"Word/{base}")
+                if os.path.exists(pdf_out):
+                    zf.write(pdf_out, f"PDF/{name_no_ext}.pdf")
 
     zip_buffer.seek(0)
     return send_file(
