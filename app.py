@@ -357,21 +357,25 @@ def fill_template(template_bytes: bytes, mapping: dict) -> bytes:
 #                    weasyprint (fallback)
 # ──────────────────────────────────────────────
 
-def _pdf_via_libreoffice(docx_path: str, out_dir: str) -> str | None:
+def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str]:
+    """Convert a list of docx files to PDF in one LibreOffice call. Returns {docx_path: pdf_path}."""
     import subprocess
+    if not docx_paths:
+        return {}
     try:
         r = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", out_dir, docx_path],
-            capture_output=True, timeout=30
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir] + docx_paths,
+            capture_output=True, timeout=120
         )
-        if r.returncode == 0:
-            base = os.path.splitext(os.path.basename(docx_path))[0]
-            p = os.path.join(out_dir, base + ".pdf")
-            return p if os.path.exists(p) else None
     except Exception:
-        pass
-    return None
+        return {}
+    result = {}
+    for docx_path in docx_paths:
+        base = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(out_dir, base + ".pdf")
+        if os.path.exists(pdf_path):
+            result[docx_path] = pdf_path
+    return result
 
 
 def _pdf_via_weasyprint(docx_path: str, out_dir: str) -> str | None:
@@ -403,12 +407,16 @@ p { margin-bottom: 6pt; }
         return None
 
 
-def docx_to_pdf(docx_path: str, out_dir: str) -> str | None:
-    # Try LibreOffice first (available in Docker image); fall back to weasyprint
-    pdf = _pdf_via_libreoffice(docx_path, out_dir)
-    if pdf:
-        return pdf
-    return _pdf_via_weasyprint(docx_path, out_dir)
+def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
+    """Batch convert docx→PDF. Falls back to weasyprint per-file if LibreOffice unavailable."""
+    results = _pdf_batch_libreoffice(docx_paths, out_dir)
+    # weasyprint fallback for any that failed
+    for p in docx_paths:
+        if p not in results:
+            pdf = _pdf_via_weasyprint(p, out_dir)
+            if pdf:
+                results[p] = pdf
+    return results
 
 
 # ──────────────────────────────────────────────
@@ -431,35 +439,44 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
     zip_buffer = io.BytesIO()
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Phase 1: generate all Word files
+        docx_entries = []  # list of (unique_name, docx_path)
+        for i, row in enumerate(rows, 1):
+            company = row.get("公司名称", f"客户{i}")
+            base = safe_filename(company) + "_付款通知书"
+            name_count[base] = name_count.get(base, 0) + 1
+            cnt = name_count[base]
+            unique = base if cnt == 1 else f"{base}_{cnt}"
+
+            try:
+                docx_bytes = fill_template(template_bytes, row)
+            except Exception as e:
+                job_update(job_id, done=True, error=f"第 {i} 行填充模板失败：{e}")
+                return
+
+            docx_path = os.path.join(tmpdir, f"{unique}.docx")
+            with open(docx_path, "wb") as f:
+                f.write(docx_bytes)
+            docx_entries.append((unique, docx_path))
+
+            pct = int(10 + 40 * i / total)
+            job_update(job_id, pct=pct, label=f"生成 Word {i}/{total}…")
+
+        # Phase 2: batch convert all docx → PDF in one LibreOffice call
+        job_update(job_id, pct=55, label="批量转换 PDF…")
+        docx_paths = [p for _, p in docx_entries]
+        pdf_map = docx_to_pdf_batch(docx_paths, tmpdir)
+
+        # Phase 3: pack ZIP
+        job_update(job_id, pct=90, label="打包 ZIP…")
         pdf_count = 0
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, row in enumerate(rows, 1):
-                company = row.get("公司名称", f"客户{i}")
-                base = safe_filename(company) + "_付款通知书"
-                name_count[base] = name_count.get(base, 0) + 1
-                cnt = name_count[base]
-                unique = base if cnt == 1 else f"{base}_{cnt}"
-
-                # Generate DOCX
-                try:
-                    docx_bytes = fill_template(template_bytes, row)
-                except Exception as e:
-                    job_update(job_id, done=True, error=f"第 {i} 行填充模板失败：{e}")
-                    return
-
-                docx_path = os.path.join(tmpdir, f"{unique}.docx")
-                with open(docx_path, "wb") as f:
-                    f.write(docx_bytes)
+            for unique, docx_path in docx_entries:
                 zf.write(docx_path, f"Word/{unique}.docx")
-
-                # Generate PDF
-                pdf_path = docx_to_pdf(docx_path, tmpdir)
+                pdf_path = pdf_map.get(docx_path)
                 if pdf_path:
                     zf.write(pdf_path, f"PDF/{unique}.pdf")
                     pdf_count += 1
-
-                pct = int(10 + 85 * i / total)
-                job_update(job_id, pct=pct, label=f"已处理 {i}/{total}…")
 
     zip_buffer.seek(0)
     pdf_note = f"，其中 PDF {pdf_count} 份" if pdf_count else "（PDF 生成失败，仅含 Word）"
@@ -546,21 +563,26 @@ def generate_sync():
     name_count: dict[str, int] = {}
     zip_buffer = io.BytesIO()
     with tempfile.TemporaryDirectory() as tmpdir:
+        docx_entries = []
+        for i, row in enumerate(rows, 1):
+            company = row.get("公司名称", f"客户{i}")
+            base = safe_filename(company) + "_付款通知书"
+            name_count[base] = name_count.get(base, 0) + 1
+            cnt = name_count[base]
+            unique = base if cnt == 1 else f"{base}_{cnt}"
+            docx_bytes = fill_template(template_bytes, row)
+            docx_path = os.path.join(tmpdir, f"{unique}.docx")
+            with open(docx_path, "wb") as f:
+                f.write(docx_bytes)
+            docx_entries.append((unique, docx_path))
+
+        pdf_map = docx_to_pdf_batch([p for _, p in docx_entries], tmpdir)
+
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, row in enumerate(rows, 1):
-                company = row.get("公司名称", f"客户{i}")
-                base = safe_filename(company) + "_付款通知书"
-                name_count[base] = name_count.get(base, 0) + 1
-                cnt = name_count[base]
-                unique = base if cnt == 1 else f"{base}_{cnt}"
-                docx_bytes = fill_template(template_bytes, row)
-                docx_path = os.path.join(tmpdir, f"{unique}.docx")
-                with open(docx_path, "wb") as f:
-                    f.write(docx_bytes)
+            for unique, docx_path in docx_entries:
                 zf.write(docx_path, f"Word/{unique}.docx")
-                pdf_path = docx_to_pdf(docx_path, tmpdir)
-                if pdf_path:
-                    zf.write(pdf_path, f"PDF/{unique}.pdf")
+                if docx_path in pdf_map:
+                    zf.write(pdf_map[docx_path], f"PDF/{unique}.pdf")
 
     zip_buffer.seek(0)
     return send_file(zip_buffer, mimetype="application/zip",
