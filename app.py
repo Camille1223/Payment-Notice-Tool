@@ -363,7 +363,7 @@ def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str
     if not docx_paths:
         return {}
     try:
-        r = subprocess.run(
+        subprocess.run(
             ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir] + docx_paths,
             capture_output=True, timeout=120
         )
@@ -376,6 +376,22 @@ def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str
         if os.path.exists(pdf_path):
             result[docx_path] = pdf_path
     return result
+
+
+def _pdf_via_unoconvert(docx_path: str, out_dir: str) -> str | None:
+    """Convert a single docx to PDF via unoserver (resident LibreOffice process)."""
+    import subprocess
+    pdf_path = os.path.join(out_dir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+    try:
+        r = subprocess.run(
+            ["unoconvert", "--convert-to", "pdf", "--port", "2003", docx_path, pdf_path],
+            capture_output=True, timeout=30
+        )
+        if r.returncode == 0 and os.path.exists(pdf_path):
+            return pdf_path
+    except Exception:
+        pass
+    return None
 
 
 def _pdf_via_weasyprint(docx_path: str, out_dir: str) -> str | None:
@@ -408,14 +424,32 @@ p { margin-bottom: 6pt; }
 
 
 def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
-    """Batch convert docx→PDF. Falls back to weasyprint per-file if LibreOffice unavailable."""
-    results = _pdf_batch_libreoffice(docx_paths, out_dir)
-    # weasyprint fallback for any that failed
+    """Batch convert docx→PDF. Uses unoserver if available, then LibreOffice batch, then weasyprint."""
+    if not docx_paths:
+        return {}
+
+    # Try unoserver first (resident process, fastest)
+    results = {}
+    remaining = []
     for p in docx_paths:
-        if p not in results:
-            pdf = _pdf_via_weasyprint(p, out_dir)
-            if pdf:
-                results[p] = pdf
+        pdf = _pdf_via_unoconvert(p, out_dir)
+        if pdf:
+            results[p] = pdf
+        else:
+            remaining.append(p)
+
+    # Fallback: one-shot LibreOffice batch for any that failed
+    if remaining:
+        batch = _pdf_batch_libreoffice(remaining, out_dir)
+        results.update(batch)
+        remaining = [p for p in remaining if p not in batch]
+
+    # Last resort: weasyprint per file
+    for p in remaining:
+        pdf = _pdf_via_weasyprint(p, out_dir)
+        if pdf:
+            results[p] = pdf
+
     return results
 
 
