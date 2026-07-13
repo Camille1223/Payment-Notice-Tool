@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # weasyprint needs pango/cairo/gdk-pixbuf; libreoffice for higher-fidelity PDF
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf2.0-0 \
+    libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 \
     libffi-dev shared-mime-info \
     fonts-noto-cjk fonts-noto-cjk-extra \
     libreoffice-writer libreoffice-calc \
