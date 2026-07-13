@@ -281,21 +281,44 @@ def excel_rows(xlsx_bytes: bytes) -> list[dict]:
 # DOCX merge  –  handles {field} across split runs
 # ──────────────────────────────────────────────
 
+def _run_has_drawing(run) -> bool:
+    """Return True if this run contains an image/drawing element (must not be touched)."""
+    return bool(run._r.findall('.//' + qn('w:drawing')))
+
+
 def _merge_runs_in_paragraph(para):
-    """Coalesce all runs in a paragraph into a single run so split fields can be matched."""
-    if len(para.runs) < 2:
+    """Coalesce consecutive text-only runs so split {field} placeholders can be matched.
+    Runs that contain drawings are left completely alone."""
+    runs = para.runs
+    if len(runs) < 2:
         return
-    full_text = "".join(r.text for r in para.runs)
-    # keep formatting of first run, drop rest
-    first = para.runs[0]
-    first.text = full_text
-    for r in para.runs[1:]:
-        r.text = ""
+
+    # Build groups of consecutive text-only runs; flush each group into its first run.
+    group_start = None
+    group_text = ""
+    for run in runs:
+        if _run_has_drawing(run):
+            # flush any open group, then skip this run entirely
+            if group_start is not None:
+                group_start.text = group_text
+                group_start = None
+                group_text = ""
+            continue
+        if group_start is None:
+            group_start = run
+            group_text = run.text or ""
+        else:
+            group_text += run.text or ""
+            run.text = ""
+    if group_start is not None:
+        group_start.text = group_text
 
 
 def _replace_in_paragraph(para, mapping: dict):
     _merge_runs_in_paragraph(para)
     for run in para.runs:
+        if _run_has_drawing(run):
+            continue
         for key, val in mapping.items():
             placeholder = "{" + key + "}"
             if placeholder in run.text:
