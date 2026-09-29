@@ -487,79 +487,64 @@ def _pdf_via_unoconvert(docx_path: str, out_dir: str) -> str | None:
     return None
 
 
-def _pdf_via_weasyprint(docx_path: str, out_dir: str) -> str | None:
-    """Convert docx → HTML → PDF using weasyprint (pure Python, CJK-capable)."""
+_WEASYPRINT_CSS = """
+@font-face {
+  font-family: 'CJK';
+  src: local('Noto Sans CJK SC'), local('Noto Sans SC'), local('Source Han Sans CN'),
+       local('Microsoft YaHei'), local('SimHei'), local('WenQuanYi Micro Hei');
+}
+@page { margin: 2cm; size: A4; }
+body {
+  font-family: 'CJK', 'Microsoft YaHei', SimHei, Arial, sans-serif;
+  font-size: 10.5pt; line-height: 1.6; color: #000;
+}
+p { margin: 0 0 4pt 0; }
+table { border-collapse: collapse; width: 100%; margin: 8pt 0; }
+td, th { border: 1px solid #999; padding: 5pt 8pt; vertical-align: top; }
+img { max-width: 100%; }
+strong { font-weight: bold; }
+"""
+
+def _pdf_via_mammoth_weasyprint(docx_path: str, out_dir: str) -> str | None:
+    """Convert docx → rich HTML (with embedded images) → PDF via weasyprint.
+    Pure Python, no external programs needed. Works on Linux (Render) with
+    apt packages: fonts-noto-cjk libpango-1.0-0 libpangocairo-1.0-0 libcairo2."""
     try:
-        from docx2python import docx2python
-        import html as html_lib
+        import mammoth
         from weasyprint import HTML as WH, CSS
-        # Extract text as simple HTML via docx2python
-        result = docx2python(docx_path)
-        lines = []
-        for body_section in result.body:
-            for para in body_section:
-                for cell in para:
-                    text = " ".join(cell)
-                    lines.append("<p>" + html_lib.escape(text) + "</p>")
-        html_content = """<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<style>
-@font-face { font-family: 'NotoSansSC'; src: local('Noto Sans CJK SC'), local('Source Han Sans CN'), local('Microsoft YaHei'), local('SimHei'); }
-body { font-family: 'NotoSansSC', 'Microsoft YaHei', SimHei, sans-serif; font-size: 11pt; margin: 2cm; line-height: 1.6; }
-p { margin-bottom: 6pt; }
-</style></head><body>""" + "\n".join(lines) + "</body></html>"
+        with open(docx_path, "rb") as f:
+            result = mammoth.convert_to_html(f)
+        html_body = result.value
+        html_full = (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            f"<style>{_WEASYPRINT_CSS}</style></head><body>"
+            f"{html_body}</body></html>"
+        )
         pdf_path = os.path.join(out_dir, os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
-        WH(string=html_content).write_pdf(pdf_path)
+        WH(string=html_full).write_pdf(pdf_path)
         return pdf_path if os.path.exists(pdf_path) else None
     except Exception as e:
-        app.logger.warning("weasyprint fallback failed: %s", e)
+        app.logger.warning("mammoth+weasyprint failed for %s: %s", docx_path, e)
         return None
 
 
-def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
-    """Batch convert docx→PDF.
-    Priority: win32com (Windows/Word) → unoserver → LibreOffice batch → LibreOffice per-file → weasyprint.
-    Any stage that fails is skipped gracefully; remaining files fall through to the next stage."""
-    if not docx_paths:
-        return {}
-
-    # 1. Win32com via Microsoft Word (Windows, highest fidelity)
-    results = _pdf_batch_win32com(docx_paths, out_dir)
-    remaining = [p for p in docx_paths if p not in results]
-
-    # 2. unoserver (resident LibreOffice process)
-    still_remaining = []
-    for p in remaining:
-        pdf = _pdf_via_unoconvert(p, out_dir)
-        if pdf:
-            results[p] = pdf
-        else:
-            still_remaining.append(p)
-    remaining = still_remaining
-
-    # 3. LibreOffice batch (all remaining in one shot)
-    if remaining:
-        batch = _pdf_batch_libreoffice(remaining, out_dir)
-        results.update(batch)
-        remaining = [p for p in remaining if p not in batch]
-
-    # 4. LibreOffice per-file (if batch failed or timed out)
-    still_remaining = []
-    for p in remaining:
-        pdf = _pdf_one_libreoffice(p, out_dir)
-        if pdf:
-            results[p] = pdf
-        else:
-            still_remaining.append(p)
-    remaining = still_remaining
-
-    # 5. Last resort: weasyprint per file
-    for p in remaining:
-        pdf = _pdf_via_weasyprint(p, out_dir)
-        if pdf:
-            results[p] = pdf
-
-    return results
+def docx_to_pdf_one(docx_path: str, out_dir: str) -> str | None:
+    """Convert a single docx to PDF, trying all available backends in priority order."""
+    # 1. win32com (Windows + Word installed)
+    r = _pdf_batch_win32com([docx_path], out_dir)
+    if r:
+        return r[docx_path]
+    # 2. mammoth + weasyprint (pure Python, primary for Linux/Render)
+    pdf = _pdf_via_mammoth_weasyprint(docx_path, out_dir)
+    if pdf:
+        return pdf
+    # 3. unoserver
+    pdf = _pdf_via_unoconvert(docx_path, out_dir)
+    if pdf:
+        return pdf
+    # 4. LibreOffice one-shot
+    pdf = _pdf_one_libreoffice(docx_path, out_dir)
+    return pdf
 
 
 # ──────────────────────────────────────────────
@@ -604,26 +589,45 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
             pct = int(10 + 40 * i / total)
             job_update(job_id, pct=pct, label=f"生成 Word {i}/{total}…")
 
-        # Phase 2: batch convert all docx → PDF
-        job_update(job_id, pct=55, label="批量转换 PDF…")
+        # Phase 2: convert docx → PDF
+        # Try win32com batch first (Windows), then fall back per-file for any remaining
+        job_update(job_id, pct=55, label="转换 PDF…")
         docx_paths = [p for _, p in docx_entries]
-        pdf_map = docx_to_pdf_batch(docx_paths, tmpdir)
+        pdf_map: dict[str, str] = {}
 
-        # Phase 3: pack ZIP — write directly to persistent job file
-        job_update(job_id, pct=90, label="打包 ZIP…")
-        pdf_count = 0
+        # Attempt batch win32com (fast on Windows)
+        batch = _pdf_batch_win32com(docx_paths, tmpdir)
+        pdf_map.update(batch)
+        remaining = [p for p in docx_paths if p not in pdf_map]
+
+        # Per-file fallback for any not converted yet
+        for i, docx_path in enumerate(remaining, 1):
+            pct = int(55 + 35 * (len(batch) + i) / total)
+            job_update(job_id, pct=pct, label=f"转换 PDF {len(batch)+i}/{total}…")
+            # try mammoth+weasyprint → unoserver → libreoffice
+            pdf = (_pdf_via_mammoth_weasyprint(docx_path, tmpdir)
+                   or _pdf_via_unoconvert(docx_path, tmpdir)
+                   or _pdf_one_libreoffice(docx_path, tmpdir))
+            if pdf:
+                pdf_map[docx_path] = pdf
+
+        pdf_entries = []
+        for unique, docx_path in docx_entries:
+            pdf_path = pdf_map.get(docx_path)
+            if pdf_path:
+                pdf_entries.append((unique, pdf_path))
+
+        # Phase 3: pack ZIP — PDF only
+        job_update(job_id, pct=92, label="打包 ZIP…")
+        pdf_count = len(pdf_entries)
         zip_out = _zip_path(job_id)
         with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zf:
-            for unique, docx_path in docx_entries:
-                zf.write(docx_path, f"Word/{unique}.docx")
-                pdf_path = pdf_map.get(docx_path)
-                if pdf_path:
-                    zf.write(pdf_path, f"PDF/{unique}.pdf")
-                    pdf_count += 1
+            for unique, pdf_path in pdf_entries:
+                zf.write(pdf_path, f"PDF/{unique}.pdf")
 
-    pdf_note = f"，其中 PDF {pdf_count} 份" if pdf_count else "（PDF 生成失败，仅含 Word）"
+    pdf_note = f"共生成 PDF {pdf_count}/{total} 份" if pdf_count else "PDF 生成失败"
     job_update(job_id, pct=100, label="完成", done=True,
-               summary=f"共生成 {total} 份{pdf_note}")
+               summary=pdf_note)
 
 
 def safe_filename(name: str) -> str:
@@ -712,13 +716,11 @@ def generate_sync():
                 f.write(docx_bytes)
             docx_entries.append((unique, docx_path))
 
-        pdf_map = docx_to_pdf_batch([p for _, p in docx_entries], tmpdir)
-
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for unique, docx_path in docx_entries:
-                zf.write(docx_path, f"Word/{unique}.docx")
-                if docx_path in pdf_map:
-                    zf.write(pdf_map[docx_path], f"PDF/{unique}.pdf")
+                pdf_path = docx_to_pdf_one(docx_path, tmpdir)
+                if pdf_path:
+                    zf.write(pdf_path, f"PDF/{unique}.pdf")
 
     zip_buffer.seek(0)
     return send_file(zip_buffer, mimetype="application/zip",

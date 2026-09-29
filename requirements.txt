@@ -1,6 +1,8 @@
 flask>=3.0
 openpyxl>=3.1
 python-docx>=1.1
-unoserver>=2.1
+mammoth>=1.8
+weasyprint>=61.0
 gunicorn>=22.0
-# Windows local: pip install pywin32  (win32com used automatically if Word is installed)
+# Windows local only (auto-detected, not installed in container):
+# pip install pywin32
