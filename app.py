@@ -357,6 +357,41 @@ def fill_template(template_bytes: bytes, mapping: dict) -> bytes:
 #                    weasyprint (fallback)
 # ──────────────────────────────────────────────
 
+def _pdf_batch_win32com(docx_paths: list[str], out_dir: str) -> dict[str, str]:
+    """Convert docx→PDF via Word COM automation (Windows only, highest fidelity)."""
+    try:
+        import win32com.client
+    except ImportError:
+        return {}
+    results = {}
+    word = None
+    try:
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        for docx_path in docx_paths:
+            base = os.path.splitext(os.path.basename(docx_path))[0]
+            pdf_path = os.path.join(out_dir, base + ".pdf")
+            try:
+                abs_docx = os.path.abspath(docx_path)
+                abs_pdf  = os.path.abspath(pdf_path)
+                doc = word.Documents.Open(abs_docx)
+                doc.SaveAs(abs_pdf, FileFormat=17)  # 17 = wdFormatPDF
+                doc.Close(False)
+                if os.path.exists(pdf_path):
+                    results[docx_path] = pdf_path
+            except Exception as e:
+                app.logger.warning("win32com PDF failed for %s: %s", docx_path, e)
+    except Exception as e:
+        app.logger.warning("win32com Word init failed: %s", e)
+    finally:
+        if word:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+    return results
+
+
 def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str]:
     """Convert a list of docx files to PDF in one LibreOffice call. Returns {docx_path: pdf_path}."""
     import subprocess
@@ -424,27 +459,29 @@ p { margin-bottom: 6pt; }
 
 
 def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
-    """Batch convert docx→PDF. Uses unoserver if available, then LibreOffice batch, then weasyprint."""
+    """Batch convert docx→PDF.
+    Priority: win32com (Windows/Word) → unoserver → LibreOffice batch → weasyprint."""
     if not docx_paths:
         return {}
 
-    # Try unoserver first (resident process, fastest)
-    results = {}
-    remaining = []
-    for p in docx_paths:
+    # 1. Win32com via Microsoft Word (Windows, highest fidelity)
+    results = _pdf_batch_win32com(docx_paths, out_dir)
+    remaining = [p for p in docx_paths if p not in results]
+
+    # 2. unoserver (resident LibreOffice process)
+    for p in list(remaining):
         pdf = _pdf_via_unoconvert(p, out_dir)
         if pdf:
             results[p] = pdf
-        else:
-            remaining.append(p)
+            remaining.remove(p)
 
-    # Fallback: one-shot LibreOffice batch for any that failed
+    # 3. One-shot LibreOffice batch
     if remaining:
         batch = _pdf_batch_libreoffice(remaining, out_dir)
         results.update(batch)
         remaining = [p for p in remaining if p not in batch]
 
-    # Last resort: weasyprint per file
+    # 4. Last resort: weasyprint per file
     for p in remaining:
         pdf = _pdf_via_weasyprint(p, out_dir)
         if pdf:
@@ -477,7 +514,7 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
         docx_entries = []  # list of (unique_name, docx_path)
         for i, row in enumerate(rows, 1):
             company = row.get("公司名称", f"客户{i}")
-            base = safe_filename(company) + "_付款通知书"
+            base = "付款通知_" + safe_filename(company)
             name_count[base] = name_count.get(base, 0) + 1
             cnt = name_count[base]
             unique = base if cnt == 1 else f"{base}_{cnt}"
@@ -600,7 +637,7 @@ def generate_sync():
         docx_entries = []
         for i, row in enumerate(rows, 1):
             company = row.get("公司名称", f"客户{i}")
-            base = safe_filename(company) + "_付款通知书"
+            base = "付款通知_" + safe_filename(company)
             name_count[base] = name_count.get(base, 0) + 1
             cnt = name_count[base]
             unique = base if cnt == 1 else f"{base}_{cnt}"
