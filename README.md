@@ -60,11 +60,11 @@
 ```
 付款通知书.zip
 ├── Word/
-│   ├── ABC有限公司_付款通知书.docx
-│   └── XYZ股份公司_付款通知书.docx
+│   ├── 付款通知_ABC有限公司.docx
+│   └── 付款通知_XYZ股份公司.docx
 └── PDF/
-    ├── ABC有限公司_付款通知书.pdf
-    └── XYZ股份公司_付款通知书.pdf
+    ├── 付款通知_ABC有限公司.pdf
+    └── 付款通知_XYZ股份公司.pdf
 ```
 
 ### 注意事项
@@ -84,7 +84,7 @@ python app.py
 # 访问 http://127.0.0.1:5000
 ```
 
-> 本地运行生成 PDF 需要安装 [LibreOffice](https://www.libreoffice.org/download/download/)。
+> 本地运行需安装 Microsoft Word（Windows）或 [LibreOffice](https://www.libreoffice.org/download/download/)（跨平台），用于生成 PDF。
 
 ### 技术栈
 
@@ -148,11 +148,11 @@ The downloaded ZIP is structured as:
 ```
 payment-notices.zip
 ├── Word/
-│   ├── ABC_Co_Ltd_payment_notice.docx
-│   └── XYZ_Corp_payment_notice.docx
+│   ├── 付款通知_ABC_Co_Ltd.docx
+│   └── 付款通知_XYZ_Corp.docx
 └── PDF/
-    ├── ABC_Co_Ltd_payment_notice.pdf
-    └── XYZ_Corp_payment_notice.pdf
+    ├── 付款通知_ABC_Co_Ltd.pdf
+    └── 付款通知_XYZ_Corp.pdf
 ```
 
 ### Notes
@@ -172,7 +172,7 @@ python app.py
 # Open http://127.0.0.1:5000
 ```
 
-> PDF generation requires [LibreOffice](https://www.libreoffice.org/download/download/) to be installed locally.
+> PDF generation requires Microsoft Word (Windows) or [LibreOffice](https://www.libreoffice.org/download/download/) (cross-platform) to be installed locally.
 
 ### Tech Stack
 

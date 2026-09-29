@@ -17,16 +17,57 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
 
 # ──────────────────────────────────────────────
-# In-memory job store for progress tracking
+# File-based job store — survives across gunicorn
+# workers and process restarts.  Each job is a
+# small JSON file in JOB_DIR; zip payload written
+# alongside as <job_id>.zip.
 # ──────────────────────────────────────────────
-_jobs: dict[str, dict] = {}
-_jobs_lock = threading.Lock()
+JOB_DIR = os.path.join(tempfile.gettempdir(), "pnt_jobs")
+os.makedirs(JOB_DIR, exist_ok=True)
+
+_meta_lock = threading.Lock()  # guards same-process concurrent writes only
+
+
+def _meta_path(job_id: str) -> str:
+    return os.path.join(JOB_DIR, f"{job_id}.json")
+
+
+def _zip_path(job_id: str) -> str:
+    return os.path.join(JOB_DIR, f"{job_id}.zip")
+
+
+def job_create(job_id: str, **kw):
+    import json
+    data = {"pct": 5, "label": "已收到文件…", "done": False}
+    data.update(kw)
+    with _meta_lock:
+        with open(_meta_path(job_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
 
 
 def job_update(job_id: str, **kw):
-    with _jobs_lock:
-        if job_id in _jobs:
-            _jobs[job_id].update(kw)
+    import json
+    path = _meta_path(job_id)
+    with _meta_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data.update(kw)
+        # never persist raw zip bytes into JSON — stored in separate file
+        data.pop("zip_data", None)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+
+def job_read(job_id: str) -> dict:
+    import json
+    try:
+        with open(_meta_path(job_id), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 HTML = """
@@ -397,10 +438,12 @@ def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str
     import subprocess
     if not docx_paths:
         return {}
+    # Timeout scales with number of files; cap at 180 s
+    timeout = min(30 + 5 * len(docx_paths), 180)
     try:
         subprocess.run(
             ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir] + docx_paths,
-            capture_output=True, timeout=120
+            capture_output=True, timeout=timeout
         )
     except Exception:
         return {}
@@ -411,6 +454,21 @@ def _pdf_batch_libreoffice(docx_paths: list[str], out_dir: str) -> dict[str, str
         if os.path.exists(pdf_path):
             result[docx_path] = pdf_path
     return result
+
+
+def _pdf_one_libreoffice(docx_path: str, out_dir: str) -> str | None:
+    """Convert a single docx to PDF via LibreOffice (per-file fallback with short timeout)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+            capture_output=True, timeout=30
+        )
+    except Exception:
+        return None
+    base = os.path.splitext(os.path.basename(docx_path))[0]
+    pdf_path = os.path.join(out_dir, base + ".pdf")
+    return pdf_path if os.path.exists(pdf_path) else None
 
 
 def _pdf_via_unoconvert(docx_path: str, out_dir: str) -> str | None:
@@ -460,7 +518,8 @@ p { margin-bottom: 6pt; }
 
 def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
     """Batch convert docx→PDF.
-    Priority: win32com (Windows/Word) → unoserver → LibreOffice batch → weasyprint."""
+    Priority: win32com (Windows/Word) → unoserver → LibreOffice batch → LibreOffice per-file → weasyprint.
+    Any stage that fails is skipped gracefully; remaining files fall through to the next stage."""
     if not docx_paths:
         return {}
 
@@ -469,19 +528,32 @@ def docx_to_pdf_batch(docx_paths: list[str], out_dir: str) -> dict[str, str]:
     remaining = [p for p in docx_paths if p not in results]
 
     # 2. unoserver (resident LibreOffice process)
-    for p in list(remaining):
+    still_remaining = []
+    for p in remaining:
         pdf = _pdf_via_unoconvert(p, out_dir)
         if pdf:
             results[p] = pdf
-            remaining.remove(p)
+        else:
+            still_remaining.append(p)
+    remaining = still_remaining
 
-    # 3. One-shot LibreOffice batch
+    # 3. LibreOffice batch (all remaining in one shot)
     if remaining:
         batch = _pdf_batch_libreoffice(remaining, out_dir)
         results.update(batch)
         remaining = [p for p in remaining if p not in batch]
 
-    # 4. Last resort: weasyprint per file
+    # 4. LibreOffice per-file (if batch failed or timed out)
+    still_remaining = []
+    for p in remaining:
+        pdf = _pdf_one_libreoffice(p, out_dir)
+        if pdf:
+            results[p] = pdf
+        else:
+            still_remaining.append(p)
+    remaining = still_remaining
+
+    # 5. Last resort: weasyprint per file
     for p in remaining:
         pdf = _pdf_via_weasyprint(p, out_dir)
         if pdf:
@@ -507,7 +579,6 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
 
     total = len(rows)
     name_count: dict[str, int] = {}
-    zip_buffer = io.BytesIO()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Phase 1: generate all Word files
@@ -533,15 +604,16 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
             pct = int(10 + 40 * i / total)
             job_update(job_id, pct=pct, label=f"生成 Word {i}/{total}…")
 
-        # Phase 2: batch convert all docx → PDF in one LibreOffice call
+        # Phase 2: batch convert all docx → PDF
         job_update(job_id, pct=55, label="批量转换 PDF…")
         docx_paths = [p for _, p in docx_entries]
         pdf_map = docx_to_pdf_batch(docx_paths, tmpdir)
 
-        # Phase 3: pack ZIP
+        # Phase 3: pack ZIP — write directly to persistent job file
         job_update(job_id, pct=90, label="打包 ZIP…")
         pdf_count = 0
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zip_out = _zip_path(job_id)
+        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zf:
             for unique, docx_path in docx_entries:
                 zf.write(docx_path, f"Word/{unique}.docx")
                 pdf_path = pdf_map.get(docx_path)
@@ -549,10 +621,8 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
                     zf.write(pdf_path, f"PDF/{unique}.pdf")
                     pdf_count += 1
 
-    zip_buffer.seek(0)
     pdf_note = f"，其中 PDF {pdf_count} 份" if pdf_count else "（PDF 生成失败，仅含 Word）"
     job_update(job_id, pct=100, label="完成", done=True,
-               zip_data=zip_buffer.getvalue(),
                summary=f"共生成 {total} 份{pdf_note}")
 
 
@@ -578,8 +648,7 @@ def start():
     data_bytes = request.files["data"].read()
 
     job_id = str(uuid.uuid4())
-    with _jobs_lock:
-        _jobs[job_id] = {"pct": 5, "label": "已收到文件…", "done": False}
+    job_create(job_id)
 
     t = threading.Thread(target=_run_job, args=(job_id, template_bytes, data_bytes), daemon=True)
     t.start()
@@ -588,28 +657,24 @@ def start():
 
 @app.route("/progress/<job_id>")
 def progress(job_id: str):
-    with _jobs_lock:
-        job = dict(_jobs.get(job_id, {}))
+    job = job_read(job_id)
     if not job:
         return jsonify(error="job not found"), 404
-    # don't send raw zip data over progress endpoint
-    job.pop("zip_data", None)
     return jsonify(job)
 
 
 @app.route("/download/<job_id>")
 def download(job_id: str):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+    job = job_read(job_id)
     if not job or not job.get("done"):
         return jsonify(error="未就绪"), 404
     if job.get("error"):
         return jsonify(error=job["error"]), 500
-    zip_data = job.get("zip_data")
-    if not zip_data:
+    zip_file = _zip_path(job_id)
+    if not os.path.exists(zip_file):
         return jsonify(error="无数据"), 500
     return send_file(
-        io.BytesIO(zip_data),
+        zip_file,
         mimetype="application/zip",
         as_attachment=True,
         download_name="付款通知书.zip",
