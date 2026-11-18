@@ -347,22 +347,33 @@ async function generate() {
 # ──────────────────────────────────────────────
 
 def excel_rows(xlsx_bytes: bytes) -> list[dict]:
-    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
-    ws = wb.active  # use active sheet instead of hardcoded "Sheet1"
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        raise ValueError("表格为空")
-    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
-    data = []
-    for row in rows[1:]:
-        if not any(v is not None for v in row):
-            continue
-        record = {}
-        for h, v in zip(headers, row):
-            if h:
+    # We only need cached cell values, not images, styles or external links.
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True,
+                                read_only=True, keep_links=False)
+    try:
+        ws = wb.active  # preserve the user's active-sheet selection
+        # Ignore inflated worksheet dimensions caused by formatting empty cells.
+        ws.reset_dimensions()
+        rows = ws.iter_rows(values_only=True)
+        first = next(rows, None)
+        if first is None:
+            raise ValueError("表格为空")
+        headers = [(index, str(h).strip()) for index, h in enumerate(first)
+                   if h is not None and str(h).strip()]
+        data = []
+        for row in rows:
+            if not any(v is not None for v in row):
+                continue
+            record = {}
+            for index, h in headers:
+                # Streaming rows omit trailing blank cells: retain those keys
+                # as empty strings, exactly as the previous cell-object reader.
+                v = row[index] if index < len(row) else None
                 record[h] = str(v).strip() if v is not None else ""
-        data.append(record)
-    return data
+            data.append(record)
+        return data
+    finally:
+        wb.close()
 
 
 # ──────────────────────────────────────────────
@@ -726,6 +737,8 @@ def _run_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
 
 
 def _process_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
+    job_update(job_id, pct=7, label="正在读取 Excel 数据…")
+    read_started = time.perf_counter()
     try:
         rows = excel_rows(data_bytes)
     except Exception as e:
@@ -737,6 +750,7 @@ def _process_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
         return
 
     total = len(rows)
+    app.logger.info("Excel parsed: rows=%d, seconds=%.3f", total, time.perf_counter() - read_started)
     if template_bytes.startswith(b"%PDF-"):
         _process_pdf_job(job_id, template_bytes, rows)
         return
@@ -824,6 +838,7 @@ def _process_job(job_id: str, template_bytes: bytes, data_bytes: bytes):
 
 def _process_pdf_job(job_id: str, template_bytes: bytes, rows: list[dict]):
     from pdf_template import PDFTemplate
+    job_update(job_id, pct=10, label=f"已读取 {len(rows)} 条数据，正在准备 PDF 模板…")
     try:
         template = PDFTemplate(template_bytes, set(rows[0]))
     except ValueError as e:

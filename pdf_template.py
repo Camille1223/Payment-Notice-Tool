@@ -162,7 +162,7 @@ class PDFTemplate:
             raise ValueError(f"字段 {{{field.name}}} 包含当前字体不支持的字符，请去除特殊符号")
         return self._fallback, True
 
-    def render(self, mapping: dict) -> tuple[bytes, list[str]]:
+    def _plans(self, mapping: dict):
         plans, substitutions = [], set()
         for field in self.fields:
             if field.name not in mapping:
@@ -189,15 +189,22 @@ class PDFTemplate:
             if substituted:
                 substitutions.add(field.name)
             plans.append((field, font, text, x))
+        return plans, substitutions
+
+    def render(self, mapping: dict) -> tuple[bytes, list[str]]:
+        plans, substitutions = self._plans(mapping)
         with fitz.open(stream=self.base_pdf, filetype="pdf") as doc:
-            for index, (field, font, text, x) in enumerate(plans):
+            # TextWriter reuses native Font objects instead of re-embedding the
+            # same large CJK font and building glyph-width tables for each field.
+            for field, font, text, x in plans:
                 page = doc[field.page]
-                alias = f"PNTField{index}"
-                page.insert_font(fontname=alias, fontbuffer=font.buffer)
+                # Separate fields avoid PDF-device relative-position rounding
+                # between adjacent table cells while still sharing native fonts.
+                writer = fitz.TextWriter(page.rect)
+                writer.append((x, field.baseline), text, font=font, fontsize=field.size)
                 color = ((field.color >> 16 & 255) / 255,
                          (field.color >> 8 & 255) / 255,
                          (field.color & 255) / 255)
-                page.insert_text((x, field.baseline), text, fontsize=field.size,
-                                 fontname=alias, color=color, overlay=True)
+                writer.write_text(page, color=color, overlay=True)
             doc.subset_fonts()
             return doc.tobytes(garbage=4, deflate=True), sorted(substitutions)

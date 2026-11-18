@@ -6,6 +6,8 @@ import time
 import unittest
 import uuid
 import zipfile
+import re
+from datetime import date
 from unittest.mock import patch
 
 from docx import Document
@@ -103,6 +105,54 @@ class GenerationTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
         self.assertIn(".xlsx", response.json["error"])
+
+    def test_streaming_excel_preserves_active_sheet_dates_zero_and_blank_fields(self):
+        wb = Workbook()
+        wb.active.append(["错误工作表"])
+        ws = wb.create_sheet("付款数据")
+        wb.active = 1
+        ws.append([" 公司名称 ", "金额", "日期", "备注"])
+        ws.append(["测试公司", 0, date(2026, 1, 1), None])
+        ws.append([None, None, None, None])
+        ws.append(["第二公司", 123.45, None, " x "])
+        out = io.BytesIO()
+        wb.save(out)
+        self.assertEqual(tool.excel_rows(out.getvalue()), [
+            {"公司名称": "测试公司", "金额": "0", "日期": "2026-01-01 00:00:00", "备注": ""},
+            {"公司名称": "第二公司", "金额": "123.45", "日期": "", "备注": "x"},
+        ])
+
+    def test_streaming_excel_ignores_inflated_dimension_metadata(self):
+        _, source = sample_files(1)
+        out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(source)) as original, \
+             zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as rewritten:
+            for item in original.infolist():
+                data = original.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    data = re.sub(rb'<dimension ref="[^"]+"', b'<dimension ref="A1:XFD1048576"', data)
+                rewritten.writestr(item, data)
+        self.assertEqual(tool.excel_rows(out.getvalue()), [{"公司名称": "测试公司", "金额": "123"}])
+
+    def test_streaming_workbook_is_closed_after_reading(self):
+        with patch.object(tool.openpyxl, "load_workbook") as load:
+            workbook = load.return_value
+            workbook.active.iter_rows.return_value = iter([("金额", "备注"), (0,)])
+            self.assertEqual(tool.excel_rows(b"mock"), [{"金额": "0", "备注": ""}])
+            workbook.close.assert_called_once()
+            workbook.active.reset_dimensions.assert_called_once()
+            self.assertTrue(load.call_args.kwargs["read_only"])
+            self.assertFalse(load.call_args.kwargs["keep_links"])
+
+    def test_worker_reports_excel_reading_before_parsing(self):
+        job_id = str(uuid.uuid4())
+        tool.job_create(job_id)
+        def parse(data):
+            self.assertEqual(tool.job_read(job_id)["label"], "正在读取 Excel 数据…")
+            return []
+        with patch.object(tool, "excel_rows", side_effect=parse):
+            tool._process_job(job_id, b"template", b"data")
+        self.assertTrue(tool.job_read(job_id)["done"])
 
     def test_stale_job_is_not_left_spinning(self):
         job_id = str(uuid.uuid4())

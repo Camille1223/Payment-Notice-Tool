@@ -35,7 +35,64 @@ def sample_pdf():
         return doc.tobytes()
 
 
+def legacy_render(template, mapping):
+    """Frozen old drawing path, for pixel-identical optimization checks."""
+    plans, substitutions = template._plans(mapping)
+    with fitz.open(stream=template.base_pdf, filetype="pdf") as doc:
+        for index, (field, font, text, x) in enumerate(plans):
+            page = doc[field.page]
+            alias = f"PNTField{index}"
+            page.insert_font(fontname=alias, fontbuffer=font.buffer)
+            color = ((field.color >> 16 & 255) / 255,
+                     (field.color >> 8 & 255) / 255,
+                     (field.color & 255) / 255)
+            page.insert_text((x, field.baseline), text, fontsize=field.size,
+                             fontname=alias, color=color, overlay=True)
+        doc.subset_fonts()
+        return doc.tobytes(garbage=4, deflate=True), sorted(substitutions)
+
+
 class PDFTemplateTests(unittest.TestCase):
+    def assert_pixels_equal(self, first, second):
+        with fitz.open(stream=first, filetype="pdf") as before, \
+             fitz.open(stream=second, filetype="pdf") as after:
+            self.assertEqual(len(before), len(after))
+            for original, actual in zip(before, after):
+                a = original.get_pixmap(matrix=fitz.Matrix(2, 2))
+                b = actual.get_pixmap(matrix=fitz.Matrix(2, 2))
+                self.assertEqual((a.width, a.height), (b.width, b.height))
+                self.assertEqual(a.samples, b.samples)
+
+    def test_fast_writer_is_pixel_identical_to_previous_renderer(self):
+        template = PDFTemplate(sample_pdf(), {"公司名称", "金额"})
+        row = {"公司名称": "字体复用测试公司", "金额": "12345.67"}
+        old, old_fonts = legacy_render(template, row)
+        new, new_fonts = template.render(row)
+        self.assertEqual(old_fonts, new_fonts)
+        self.assert_pixels_equal(old, new)
+
+    def test_adjacent_cells_keep_exact_positions_without_relative_rounding(self):
+        with fitz.open() as doc:
+            page = doc.new_page(width=612, height=792)
+            font = fitz.Font("china-s")
+            page.insert_font(fontname="PNTTest", fontbuffer=font.buffer)
+            for left, right, name in [(40, 180, "内容"), (180, 280, "金额"), (280, 420, "维护区间")]:
+                page.draw_rect(fitz.Rect(left, 150, right, 185))
+                field = "{" + name + "}"
+                x = (left + right - font.text_length(field, fontsize=11.04)) / 2
+                page.insert_text((x, 172), field, fontname="PNTTest", fontsize=11.04)
+            template = PDFTemplate(doc.tobytes(), {"内容", "金额", "维护区间"})
+        row = {"内容": "测试服务", "金额": "123.45", "维护区间": "01.01.2026-31.12.2026"}
+        old, _ = legacy_render(template, row)
+        new, _ = template.render(row)
+        self.assert_pixels_equal(old, new)
+
+    def test_fast_writer_does_not_rebuild_page_glyph_width_tables(self):
+        template = PDFTemplate(sample_pdf(), {"公司名称", "金额"})
+        with patch.object(fitz.Document, "get_char_widths", side_effect=AssertionError("glyph width table rebuilt")):
+            rendered, _ = template.render({"公司名称": "字体复用测试", "金额": "1"})
+        self.assertTrue(rendered.startswith(b"%PDF-"))
+
     def test_preserves_static_artwork_page_and_table(self):
         source = sample_pdf()
         template = PDFTemplate(source, {"公司名称", "金额"})
