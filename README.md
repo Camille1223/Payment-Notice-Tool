@@ -6,7 +6,7 @@
 
 > 更新代码后需重新部署；网站首页显示「付款通知书 PDF 模板 (.pdf)」即表示已启用新版上传流程。Mac 可双击 `启动.command`，打开 http://127.0.0.1:5050 。PDF 模板模式不需要自动化控制 Word。
 >
-> 修复版提供明确的断线/任务丢失提示，限制 HTML→PDF 单份转换为 60 秒，串行处理生成任务以降低内存压力；PDF 转换不完整时会提示警告，ZIP 仍保留全部 Word 文件。
+> PDF 原版模式提供明确的断线、任务丢失与字段校验提示，并显示读取 Excel、准备模板和逐份填充阶段；串行处理降低免费服务的内存压力。旧 Word 同步接口仅供已有集成兼容使用。
 
 ### 推荐：PDF 模板原版模式
 
@@ -96,11 +96,11 @@ python3 -m venv .venv
 # 访问 http://127.0.0.1:5050；可用 PORT 环境变量更改端口
 ```
 
-> 本地 PDF 转换优先使用 Microsoft Word（Windows/macOS）或 [LibreOffice](https://www.libreoffice.org/download/download/)（跨平台）。Mac 需允许自动化控制 Word；HTML 备用引擎还需要 Pango 等系统库。未能生成 PDF 时仍可下载 Word 文件。
+> PDF 模板模式不需要 Word / LibreOffice 来执行批量生成：准备好带占位符的 PDF 后可直接填充。旧 Word 同步接口需要原生文档转换引擎；此兼容路径与网页 PDF 模式分开。
 
 ### 技术栈
 
-- **后端**：Python · Flask · python-docx · unoserver
+- **后端**：Python · Flask · PyMuPDF · openpyxl（原版 PDF 模式）；python-docx 等用于旧 Word 接口
 - **前端**：原生 HTML/CSS/JS（无框架依赖）
 - **部署**：Docker · Render
 
@@ -182,10 +182,10 @@ python3 -m venv .venv
 # Open http://127.0.0.1:5050
 ```
 
-> PDF generation prefers Microsoft Word (Windows/macOS) or LibreOffice. Allow Word automation on macOS. The HTML fallback requires native Pango libraries and may change layout. All Word files remain downloadable if PDF conversion fails. The hosted service must be redeployed to pick up these fixes.
+> PDF template mode fills an existing PDF and does not require Word or LibreOffice for batch generation. Native document conversion is only used by the legacy Word API. Re-deploy after uploading code changes, and verify the live version before relying on them.
 
 ### Tech Stack
 
-- **Backend**: Python · Flask · python-docx · unoserver
+- **Backend**: Python · Flask · PyMuPDF · openpyxl for PDF templates; python-docx and native converters for the legacy Word API
 - **Frontend**: Vanilla HTML/CSS/JS (no framework dependencies)
 - **Deployment**: Docker · Render
